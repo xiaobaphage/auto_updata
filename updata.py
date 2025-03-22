@@ -11,13 +11,14 @@ import shutil
 import time
 import socket
 import getpass
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, Callable
 import json
 from pathlib import Path
 from packaging import version
 from tqdm import tqdm
 from datetime import datetime, timedelta
 import re
+import threading
 
 # 全局配置
 APP_NAME = "YourAppName"  # 应用程序名称
@@ -418,39 +419,128 @@ def get_proxy_settings() -> Optional[str]:
         logger.warning(f"获取代理设置失败: {e}")
     return None
 
-if __name__ == "__main__":
-    try:
-        @atexit.register
-        def on_exit():
-            if hasattr(sys, "update_pending") and hasattr(sys, "new_version"):
-                apply_update(sys.update_pending, sys.new_version)
-
-        logger.info(f"当前版本: {CONFIG['CURRENT_VERSION']}")
-        print(f"\n正在检查更新...")
+class Updater:
+    def __init__(self, on_complete: Callable[[bool], None] = None):
+        """
+        初始化更新器
+        Args:
+            on_complete: 更新完成的回调函数，参数为更新是否成功
+        """
+        self.on_complete = on_complete
+        self._update_thread = None
+        self._is_updating = False
+        self._update_info = None
+        self._update_file = None
         
-        if update_info := check_update():
-            new_version = update_info['version']
-            print(f"\n发现新版本: {new_version}")
-            print(f"更新说明: {update_info.get('description', '无')}")
-            print(f"发布时间: {update_info.get('release_date', '未知')}")
+        # 注册退出时的更新
+        atexit.register(self._apply_pending_update)
+
+    def check_and_update(self) -> bool:
+        """检查更新（非阻塞）"""
+        if self._is_updating:
+            logger.warning("更新检查已在进行中")
+            return False
             
-            # 自动下载并安装更新
-            print("\n准备下载更新...")
-            if zip_file := download_update(update_info):
-                sys.update_pending = zip_file
-                sys.new_version = new_version
-                print("\n更新已下载，退出程序后将自动安装")
-                print("按回车键退出并开始更新...")
-            else:
-                print("\n下载更新失败，请检查网络连接后重试")
-                print("按回车键退出程序...")
-        else:
-            print("\n当前已是最新版本")
-            print("按回车键退出程序...")
-
-        input()
+        self._update_thread = threading.Thread(
+            target=self._check_and_download,
+            daemon=True
+        )
+        self._is_updating = True
+        self._update_thread.start()
+        return True
         
-    except Exception as e:
-        logger.error(f"程序异常: {e}")
-        print("\n程序发生错误，请查看日志文件了解详情")
-        input("按回车键退出程序...")
+    def _check_and_download(self):
+        """检查并下载更新"""
+        try:
+            logger.info(f"当前版本: {CONFIG['CURRENT_VERSION']}")
+            
+            if update_info := check_update():
+                new_version = update_info['version']
+                logger.info(f"发现新版本: {new_version}")
+                logger.info(f"更新说明: {update_info.get('description', '无')}")
+                
+                if zip_file := download_update(update_info):
+                    # 保存更新信息，等待程序退出时更新
+                    self._update_info = update_info
+                    self._update_file = zip_file
+                    logger.info("更新已下载，退出程序后将自动安装")
+                    if self.on_complete:
+                        self.on_complete(True)
+                else:
+                    logger.error("下载更新失败")
+                    if self.on_complete:
+                        self.on_complete(False)
+            else:
+                logger.info("当前已是最新版本")
+                if self.on_complete:
+                    self.on_complete(True)
+                
+        except Exception as e:
+            logger.error(f"更新检查异常: {e}")
+            if self.on_complete:
+                self.on_complete(False)
+            
+        finally:
+            self._is_updating = False
+
+    def _apply_pending_update(self):
+        """在程序退出时应用更新"""
+        if self._update_file and self._update_info:
+            try:
+                new_version = self._update_info['version']
+                apply_update(self._update_file, new_version)
+            except Exception as e:
+                logger.error(f"应用更新失败: {e}")
+
+    @property
+    def is_updating(self) -> bool:
+        """是否正在检查或下载更新"""
+        return self._is_updating
+
+    @property
+    def has_update(self) -> bool:
+        """是否有待安装的更新"""
+        return bool(self._update_file and self._update_info)
+
+    def get_update_info(self) -> Optional[Dict]:
+        """获取更新信息"""
+        return self._update_info
+
+# 示例用法
+if __name__ == "__main__":
+    def update_complete(success: bool):
+        if success:
+            print("\n更新完成")
+        else:
+            print("\n更新失败")
+    
+    updater = Updater(on_complete=update_complete)
+    updater.check_and_update()
+    
+    # 主程序继续运行
+    while updater.is_updating:
+        print("程序运行中...")
+        time.sleep(1)
+
+"""
+from updata import Updater
+
+def on_update_complete(success: bool):
+    if success:
+        print("更新成功，需要重启程序")
+    else:
+        print("更新失败，请稍后重试")
+
+# 创建更新器实例
+updater = Updater(on_complete=on_update_complete)
+
+# 开始检查更新（非阻塞）
+updater.check_and_update()
+
+# 主程序继续运行
+while True:
+    # 你的主程序逻辑
+    if updater.is_updating:
+        print("正在更新中...")
+    time.sleep(1)
+"""

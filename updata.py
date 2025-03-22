@@ -9,6 +9,8 @@ import tempfile
 import logging
 import shutil
 import time
+import socket
+import getpass
 from typing import Optional, Dict, Tuple, List
 import json
 from pathlib import Path
@@ -16,16 +18,77 @@ from packaging import version
 from tqdm import tqdm
 from datetime import datetime, timedelta
 
+# 全局配置
+APP_NAME = "YourAppName"  # 应用程序名称
+DEBUG = False
+
+# 获取应用数据目录
+def get_app_data_dir() -> Path:
+    """获取应用数据目录"""
+    if DEBUG:
+        return Path.cwd()
+    else:
+        app_data = Path(os.getenv('APPDATA', '')) / APP_NAME
+        app_data.mkdir(parents=True, exist_ok=True)
+        return app_data
+
+# 应用数据目录
+APP_DATA_DIR = get_app_data_dir()
+
+# 创建日志目录
+LOG_DIR = APP_DATA_DIR / 'logs'
+LOG_DIR.mkdir(exist_ok=True)
+
 # 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('update.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+def setup_logging():
+    """配置日志系统"""
+    # 获取系统和用户信息
+    computer_name = socket.gethostname()
+    username = getpass.getuser()
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 创建更新专用日志文件
+    update_log_file = LOG_DIR / f'update_{current_time}_{computer_name}.log'
+    
+    # 配置日志格式
+    formatter = logging.Formatter(
+        '%(asctime)s - [%(levelname)s] - %(message)s'
+    )
+    
+    # 文件处理器
+    file_handler = logging.FileHandler(update_log_file, encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    
+    # 配置根日志记录器
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    # 记录启动信息
+    logger.info("=" * 50)
+    logger.info(f"更新程序启动")
+    logger.info(f"计算机名称: {computer_name}")
+    logger.info(f"用户名: {username}")
+    logger.info(f"操作系统: {sys.platform}")
+    logger.info(f"Python版本: {sys.version}")
+    logger.info("=" * 50)
+    
+    return logger
+
+# 初始化日志系统
+logger = setup_logging()
+
+# 获取备份目录
+def get_backup_dir() -> Path:
+    """获取备份目录路径"""
+    backup_base = Path(tempfile.gettempdir()) / APP_NAME
+    backup_base.mkdir(parents=True, exist_ok=True)
+    return backup_base
 
 def is_valid_version(ver_str: str) -> bool:
     """验证版本号格式是否有效"""
@@ -78,14 +141,14 @@ def validate_config(config: Dict) -> bool:
 
 # 从配置文件加载配置
 def load_config() -> Dict:
-    config_path = Path('update_config.json')
+    config_path = APP_DATA_DIR / 'update_config.json' if not DEBUG else Path('update_config.json')
     default_config = {
         "VERSION_URL": "https://your-version-url/version.json",
         "UPDATE_URL": "https://your-update-url/update.zip",
         "CURRENT_VERSION": "1.0.0",
         "MAX_DOWNLOAD_SIZE": 104857600,
         "TIMEOUT": 30,
-        "BACKUP_DIR": "backup",
+        "BACKUP_DIR": str(get_backup_dir()),  # 使用临时目录
         "MAX_RETRY": 3,
         "RETRY_DELAY": 5,
         "MAX_BACKUP_COUNT": 5
@@ -100,6 +163,16 @@ def load_config() -> Dict:
                 logger.warning("配置验证失败，使用默认配置")
         except Exception as e:
             logger.warning(f"加载配置文件失败: {e}，使用默认配置")
+    else:
+        # 如果配置文件不存在，创建默认配置文件
+        try:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, ensure_ascii=False, indent=4)
+            logger.info(f"已创建默认配置文件: {config_path}")
+        except Exception as e:
+            logger.warning(f"创建默认配置文件失败: {e}")
+    
     return default_config
 
 CONFIG = load_config()
@@ -111,16 +184,31 @@ def clean_old_backups():
         if not backup_dir.exists():
             return
             
+        # 获取所有备份，包括可能存在的其他进程创建的备份
         backups = sorted(
             [d for d in backup_dir.iterdir() if d.is_dir() and d.name.startswith("backup_")],
             key=lambda x: x.stat().st_mtime,
             reverse=True
         )
         
-        # 保留最新的几个备份
+        # 清理超过最大数量的备份
         for backup in backups[CONFIG["MAX_BACKUP_COUNT"]:]:
-            shutil.rmtree(backup, ignore_errors=True)
-            logger.info(f"已清理旧备份: {backup}")
+            try:
+                shutil.rmtree(backup, ignore_errors=True)
+                logger.info(f"已清理旧备份: {backup}")
+            except Exception as e:
+                logger.warning(f"清理备份失败: {backup}, 错误: {e}")
+                
+        # 清理超过24小时的备份
+        current_time = time.time()
+        for backup in backups[:CONFIG["MAX_BACKUP_COUNT"]]:
+            try:
+                if current_time - backup.stat().st_mtime > 86400:  # 24小时 = 86400秒
+                    shutil.rmtree(backup, ignore_errors=True)
+                    logger.info(f"已清理过期备份: {backup}")
+            except Exception as e:
+                logger.warning(f"清理过期备份失败: {backup}, 错误: {e}")
+                
     except Exception as e:
         logger.warning(f"清理旧备份失败: {e}")
 
@@ -151,9 +239,10 @@ def backup_current_version() -> Optional[str]:
     backup_dir = Path(CONFIG["BACKUP_DIR"])
     backup_dir.mkdir(exist_ok=True)
     
-    # 创建带时间戳的备份目录
+    # 创建带时间戳和进程ID的备份目录，确保唯一性
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    version_backup_dir = backup_dir / f"backup_{CONFIG['CURRENT_VERSION']}_{timestamp}"
+    pid = os.getpid()
+    version_backup_dir = backup_dir / f"backup_{CONFIG['CURRENT_VERSION']}_{timestamp}_{pid}"
     version_backup_dir.mkdir(exist_ok=True)
     
     try:
@@ -254,7 +343,7 @@ def check_update() -> Optional[Dict]:
         logger.error("版本信息格式错误")
     except Exception as e:
         logger.error(f"更新检查失败: {e}")
-    return None
+        return None
 
 @retry_operation
 def download_update(update_info: Dict) -> Optional[str]:
@@ -262,10 +351,10 @@ def download_update(update_info: Dict) -> Optional[str]:
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.zip', mode='wb') as tmp_file:
             tmp_path = tmp_file.name
-            
+    
         client = httpx.Client(timeout=CONFIG["TIMEOUT"], verify=True, follow_redirects=True)
         with client.stream("GET", CONFIG["UPDATE_URL"]) as res:
-            res.raise_for_status()
+        res.raise_for_status()
             file_size = int(res.headers.get("content-length", 0))
             if file_size > CONFIG["MAX_DOWNLOAD_SIZE"]:
                 raise ValueError(f"更新包过大: {file_size/1024/1024:.1f}MB")
@@ -280,7 +369,7 @@ def download_update(update_info: Dict) -> Optional[str]:
             if not any(content_type.startswith(t) for t in valid_zip_types):
                 logger.warning(f"警告：内容类型 {content_type} 可能不是zip文件")
             
-            hasher = hashlib.sha256()
+        hasher = hashlib.sha256()
             downloaded_size = 0
             with open(tmp_path, "wb") as f:
                 with tqdm(total=file_size, unit='B', unit_scale=True, desc="下载进度") as pbar:
@@ -288,8 +377,8 @@ def download_update(update_info: Dict) -> Optional[str]:
                         downloaded_size += len(chunk)
                         if downloaded_size > CONFIG["MAX_DOWNLOAD_SIZE"]:
                             raise ValueError("文件大小超过限制")
-                        hasher.update(chunk)
-                        f.write(chunk)
+                hasher.update(chunk)
+                f.write(chunk)
                         pbar.update(len(chunk))
         
         calculated_hash = hasher.hexdigest().upper()
@@ -327,8 +416,6 @@ def apply_update(zip_path: str):
     
     abs_zip_path = Path(zip_path).resolve()
     abs_cwd = Path.cwd().resolve()
-    abs_executable = Path(sys.executable).resolve()
-    abs_script = Path(sys.argv[0]).resolve()
     abs_backup = Path(backup_path).resolve()
     
     # 创建临时解压目录
@@ -348,7 +435,7 @@ if not exist "{abs_zip_path}" (
     xcopy /E /Y /I "{abs_backup}" "{abs_cwd}"
     echo 更新失败，已恢复备份
     rmdir /S /Q "{abs_temp_dir}" 2>nul
-    pause
+    timeout /t 5 >nul
     exit /b 1
 )
 
@@ -360,7 +447,7 @@ if %ERRORLEVEL% neq 0 (
     xcopy /E /Y /I "{abs_backup}" "{abs_cwd}"
     echo 已恢复备份
     rmdir /S /Q "{abs_temp_dir}" 2>nul
-    pause
+    timeout /t 5 >nul
     exit /b 1
 )
 
@@ -372,7 +459,7 @@ if %ERRORLEVEL% neq 0 (
     xcopy /E /Y /I "{abs_backup}" "{abs_cwd}"
     echo 已恢复备份
     rmdir /S /Q "{abs_temp_dir}" 2>nul
-    pause
+    timeout /t 5 >nul
     exit /b 1
 )
 
@@ -381,9 +468,8 @@ del "{abs_zip_path}" 2>nul
 rmdir /S /Q "{abs_backup}" 2>nul
 rmdir /S /Q "{abs_temp_dir}" 2>nul
 
-echo 更新完成，正在重启程序...
-timeout /t 2 /nobreak >nul
-start "" "{abs_executable}" "{abs_script}"
+echo 更新完成
+timeout /t 5 >nul
 (goto) 2>nul & del "%~f0"
 """
     try:
@@ -419,18 +505,16 @@ if __name__ == "__main__":
         
         if update_info := check_update():
             logger.info(f"发现新版本: {update_info['version']}")
-            print(f"\n发现新版本 {update_info['version']}")
-            print(f"更新说明: {update_info.get('description', '无')}")
-            print(f"发布时间: {update_info.get('release_date', '未知')}")
+            logger.info(f"更新说明: {update_info.get('description', '无')}")
+            logger.info(f"发布时间: {update_info.get('release_date', '未知')}")
             
-            if input("\n是否现在更新？(y/N) ").lower() == 'y':
-                print("\n开始下载更新...")
-                if zip_file := download_update(update_info):
-                    sys.update_pending = zip_file
-                    logger.info("更新已下载，退出程序后自动安装...")
-                    print("\n更新已下载，退出程序后将自动安装...")
-            else:
-                print("\n已取消更新")
+            # 自动下载并安装更新
+            logger.info("开始下载更新...")
+            if zip_file := download_update(update_info):
+                sys.update_pending = zip_file
+                logger.info("更新已下载，退出程序后自动安装...")
+        else:
+            logger.info("未发现新版本")
 
         print("\n程序运行中...")
         input("按回车退出程序")

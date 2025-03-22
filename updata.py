@@ -17,10 +17,11 @@ from pathlib import Path
 from packaging import version
 from tqdm import tqdm
 from datetime import datetime, timedelta
+import re
 
 # 全局配置
 APP_NAME = "YourAppName"  # 应用程序名称
-DEBUG = False
+DEBUG = True
 
 # 获取应用数据目录
 def get_app_data_dir() -> Path:
@@ -83,13 +84,6 @@ def setup_logging():
 # 初始化日志系统
 logger = setup_logging()
 
-# 获取备份目录
-def get_backup_dir() -> Path:
-    """获取备份目录路径"""
-    backup_base = Path(tempfile.gettempdir()) / APP_NAME
-    backup_base.mkdir(parents=True, exist_ok=True)
-    return backup_base
-
 def is_valid_version(ver_str: str) -> bool:
     """验证版本号格式是否有效"""
     try:
@@ -101,57 +95,58 @@ def is_valid_version(ver_str: str) -> bool:
 
 def validate_config(config: Dict) -> bool:
     """验证配置是否有效"""
-    required_fields = {
-        "VERSION_URL": str,
-        "UPDATE_URL": str,
-        "CURRENT_VERSION": str,
-        "MAX_DOWNLOAD_SIZE": int,
-        "TIMEOUT": int,
-        "BACKUP_DIR": str,
-        "MAX_RETRY": int,
-        "RETRY_DELAY": int,
-        "MAX_BACKUP_COUNT": int
-    }
-    
     try:
-        for field, field_type in required_fields.items():
-            if field not in config:
-                logger.error(f"缺少必要配置项: {field}")
-                return False
-            if not isinstance(config[field], field_type):
-                logger.error(f"配置项类型错误: {field}")
-                return False
+        # 验证必需字段
+        required_fields = {
+            "VERSION_URL": (str, "https://"),
+            "UPDATE_URL": (str, "https://"),
+            "CURRENT_VERSION": (str, None),
+            "MAX_DOWNLOAD_SIZE": (int, lambda x: x > 0),
+            "TIMEOUT": (int, lambda x: x > 0),
+            "MAX_RETRY": (int, lambda x: x > 0),
+            "RETRY_DELAY": (int, lambda x: x > 0)
+        }
         
+        for field, (field_type, validator) in required_fields.items():
+            # 检查字段是否存在
+            if field not in config:
+                raise ValueError(f"缺少必要配置项: {field}")
+                
+            # 检查类型
+            if not isinstance(config[field], field_type):
+                raise ValueError(f"配置项类型错误: {field}")
+                
+            # 执行自定义验证
+            if validator:
+                if isinstance(validator, str) and isinstance(config[field], str):
+                    if not config[field].startswith(validator):
+                        raise ValueError(f"{field} 必须以 {validator} 开头")
+                elif callable(validator) and not validator(config[field]):
+                    raise ValueError(f"{field} 值无效")
+        
+        # 验证版本号
         if not is_valid_version(config["CURRENT_VERSION"]):
-            logger.error("当前版本号格式无效")
-            return False
-            
-        if not config["VERSION_URL"].startswith("https://"):
-            logger.error("版本检查URL必须使用HTTPS")
-            return False
-            
-        if not config["UPDATE_URL"].startswith("https://"):
-            logger.error("更新包URL必须使用HTTPS")
-            return False
+            raise ValueError("当前版本号格式无效")
             
         return True
+        
     except Exception as e:
         logger.error(f"配置验证失败: {e}")
         return False
 
-# 从配置文件加载配置
 def load_config() -> Dict:
+    """从配置文件加载配置"""
     config_path = APP_DATA_DIR / 'update_config.json' if not DEBUG else Path('update_config.json')
+    logger.info(f"配置文件路径: {config_path.absolute()}")
+    
     default_config = {
         "VERSION_URL": "https://your-version-url/version.json",
         "UPDATE_URL": "https://your-update-url/update.zip",
         "CURRENT_VERSION": "1.0.0",
         "MAX_DOWNLOAD_SIZE": 104857600,
         "TIMEOUT": 30,
-        "BACKUP_DIR": str(get_backup_dir()),  # 使用临时目录
         "MAX_RETRY": 3,
-        "RETRY_DELAY": 5,
-        "MAX_BACKUP_COUNT": 5
+        "RETRY_DELAY": 5
     }
     
     if config_path.exists():
@@ -159,6 +154,7 @@ def load_config() -> Dict:
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = {**default_config, **json.load(f)}
                 if validate_config(config):
+                    logger.info("成功加载配置文件")
                     return config
                 logger.warning("配置验证失败，使用默认配置")
         except Exception as e:
@@ -177,119 +173,6 @@ def load_config() -> Dict:
 
 CONFIG = load_config()
 
-def clean_old_backups():
-    """清理旧的备份文件"""
-    try:
-        backup_dir = Path(CONFIG["BACKUP_DIR"])
-        if not backup_dir.exists():
-            return
-            
-        # 获取所有备份，包括可能存在的其他进程创建的备份
-        backups = sorted(
-            [d for d in backup_dir.iterdir() if d.is_dir() and d.name.startswith("backup_")],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True
-        )
-        
-        # 清理超过最大数量的备份
-        for backup in backups[CONFIG["MAX_BACKUP_COUNT"]:]:
-            try:
-                shutil.rmtree(backup, ignore_errors=True)
-                logger.info(f"已清理旧备份: {backup}")
-            except Exception as e:
-                logger.warning(f"清理备份失败: {backup}, 错误: {e}")
-                
-        # 清理超过24小时的备份
-        current_time = time.time()
-        for backup in backups[:CONFIG["MAX_BACKUP_COUNT"]]:
-            try:
-                if current_time - backup.stat().st_mtime > 86400:  # 24小时 = 86400秒
-                    shutil.rmtree(backup, ignore_errors=True)
-                    logger.info(f"已清理过期备份: {backup}")
-            except Exception as e:
-                logger.warning(f"清理过期备份失败: {backup}, 错误: {e}")
-                
-    except Exception as e:
-        logger.warning(f"清理旧备份失败: {e}")
-
-def calculate_dir_hash(path: Path, exclude_dirs: List[str] = None) -> str:
-    """计算目录的哈希值
-    
-    Args:
-        path: 要计算哈希的目录路径
-        exclude_dirs: 要排除的目录列表
-    """
-    if exclude_dirs is None:
-        exclude_dirs = ['.git', '__pycache__']
-        
-    hasher = hashlib.sha256()
-    try:
-        for file in sorted(path.rglob('*')):
-            if file.is_file() and not any(p in file.parts for p in exclude_dirs):
-                rel_path = str(file.relative_to(path))
-                hasher.update(rel_path.encode())
-                hasher.update(file.read_bytes())
-        return hasher.hexdigest()
-    except Exception as e:
-        logger.error(f"计算目录哈希值失败: {e}")
-        return ""
-
-def backup_current_version() -> Optional[str]:
-    """备份当前版本"""
-    backup_dir = Path(CONFIG["BACKUP_DIR"])
-    backup_dir.mkdir(exist_ok=True)
-    
-    # 创建带时间戳和进程ID的备份目录，确保唯一性
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pid = os.getpid()
-    version_backup_dir = backup_dir / f"backup_{CONFIG['CURRENT_VERSION']}_{timestamp}_{pid}"
-    version_backup_dir.mkdir(exist_ok=True)
-    
-    try:
-        # 计算原始目录的哈希值（排除备份目录）
-        exclude_dirs = ['.git', '__pycache__', CONFIG["BACKUP_DIR"]]
-        original_hash = calculate_dir_hash(Path(), exclude_dirs)
-        
-        # 复制文件
-        for file in Path().glob('**/*'):
-            if file.is_file() and not any(p in file.parts for p in exclude_dirs):
-                dest = version_backup_dir / file.relative_to(Path())
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(file, dest)
-        
-        # 验证备份
-        backup_hash = calculate_dir_hash(version_backup_dir)
-        if not original_hash or not backup_hash or backup_hash != original_hash:
-            raise ValueError(f"备份验证失败\n原始哈希: {original_hash}\n备份哈希: {backup_hash}")
-        
-        logger.info(f"已备份当前版本到: {version_backup_dir}")
-        clean_old_backups()
-        return str(version_backup_dir)
-    except Exception as e:
-        logger.error(f"备份失败: {e}")
-        if version_backup_dir.exists():
-            shutil.rmtree(version_backup_dir)
-        return None
-
-def verify_zip_contents(zip_path: str) -> bool:
-    """验证更新包内容的安全性"""
-    try:
-        with zipfile.ZipFile(zip_path) as zf:
-            # 检查是否包含可执行文件或危险文件
-            dangerous_extensions = {'.exe', '.dll', '.bat', '.cmd', '.sh', '.vbs', '.js'}
-            for file in zf.namelist():
-                ext = Path(file).suffix.lower()
-                if ext in dangerous_extensions:
-                    logger.error(f"更新包含危险文件: {file}")
-                    return False
-                if '../' in file or file.startswith('/'):
-                    logger.error(f"更新包含危险路径: {file}")
-                    return False
-        return True
-    except Exception as e:
-        logger.error(f"验证更新包内容失败: {e}")
-        return False
-
 def retry_operation(operation, max_retries: int = None, delay: int = None):
     """重试装饰器"""
     if max_retries is None:
@@ -298,14 +181,28 @@ def retry_operation(operation, max_retries: int = None, delay: int = None):
         delay = CONFIG["RETRY_DELAY"]
         
     def wrapper(*args, **kwargs):
+        last_error = None
         for i in range(max_retries):
             try:
-                return operation(*args, **kwargs)
+                result = operation(*args, **kwargs)
+                if result is not None:
+                    return result
+                # 如果返回None但没有异常，说明是预期的失败，不需要重试
+                return None
+            except httpx.RequestError as e:
+                # 只对网络错误进行重试
+                last_error = e
+                if i < max_retries - 1:
+                    logger.warning(f"{operation.__name__} 失败，{delay}秒后重试: {e}")
+                    time.sleep(delay)
+                continue
             except Exception as e:
-                if i == max_retries - 1:
-                    raise
-                logger.warning(f"{operation.__name__} 失败，{delay}秒后重试: {e}")
-                time.sleep(delay)
+                # 其他错误直接返回None
+                logger.error(f"{operation.__name__} 失败: {e}")
+                return None
+                
+        if last_error:
+            logger.error(f"{operation.__name__} 重试{max_retries}次后仍然失败: {last_error}")
         return None
     return wrapper
 
@@ -348,177 +245,212 @@ def check_update() -> Optional[Dict]:
 @retry_operation
 def download_update(update_info: Dict) -> Optional[str]:
     """下载并验证更新包"""
+    tmp_path = None
     try:
+        # 创建临时文件
         with tempfile.NamedTemporaryFile(delete=False, suffix='.zip', mode='wb') as tmp_file:
             tmp_path = tmp_file.name
-    
-        client = httpx.Client(timeout=CONFIG["TIMEOUT"], verify=True, follow_redirects=True)
-        with client.stream("GET", CONFIG["UPDATE_URL"]) as res:
-            res.raise_for_status()
-            file_size = int(res.headers.get("content-length", 0))
-            if file_size > CONFIG["MAX_DOWNLOAD_SIZE"]:
-                raise ValueError(f"更新包过大: {file_size/1024/1024:.1f}MB")
             
-            content_type = res.headers.get("content-type", "").lower()
-            valid_zip_types = [
-                'application/zip',
-                'application/x-zip-compressed',
-                'application/zip-compressed',
-                'application/octet-stream'
-            ]
-            if not any(content_type.startswith(t) for t in valid_zip_types):
-                logger.warning(f"警告：内容类型 {content_type} 可能不是zip文件")
-            
-        hasher = hashlib.sha256()
-        downloaded_size = 0
-        with open(tmp_path, "wb") as f:
-            with tqdm(total=file_size, unit='B', unit_scale=True, desc="下载进度") as pbar:
-                for chunk in res.iter_bytes(chunk_size=8192):
-                    downloaded_size += len(chunk)
-                    if downloaded_size > CONFIG["MAX_DOWNLOAD_SIZE"]:
-                        raise ValueError("文件大小超过限制")
-                hasher.update(chunk)
-                f.write(chunk)
-                pbar.update(len(chunk))
-        
-        calculated_hash = hasher.hexdigest().upper()
-        expected_hash = update_info["sha256"].upper()
-        if calculated_hash != expected_hash:
-            logger.error(f"文件校验失败:")
-            logger.error(f"预期哈希值: {expected_hash}")
-            logger.error(f"实际哈希值: {calculated_hash}")
-            raise ValueError("文件校验失败")
-            
+            # 下载文件
+            with httpx.Client(
+                timeout=CONFIG["TIMEOUT"],
+                verify=True,
+                follow_redirects=True
+            ) as client:
+                # 先获取文件大小
+                with client.stream('GET', CONFIG["UPDATE_URL"]) as response:
+                    response.raise_for_status()
+                    
+                    # 获取文件大小
+                    total_size = int(response.headers.get("content-length", 0))
+                    if total_size > CONFIG["MAX_DOWNLOAD_SIZE"]:
+                        raise ValueError(f"更新包过大: {total_size/1024/1024:.1f}MB")
+                    
+                    logger.info(f"更新包大小: {total_size/1024/1024:.1f}MB")
+                    
+                    # 使用tqdm显示下载进度
+                    with tqdm(
+                        total=total_size,
+                        unit='B',
+                        unit_scale=True,
+                        desc="下载进度"
+                    ) as pbar:
+                        # 分块下载
+                        for chunk in response.iter_bytes(chunk_size=8192):
+                            if chunk:
+                                tmp_file.write(chunk)
+                                pbar.update(len(chunk))
+                
+        logger.info("下载完成，正在验证文件...")
+                
+        # 基本验证
         if not zipfile.is_zipfile(tmp_path):
             raise ValueError("无效的ZIP文件")
             
-        if not verify_zip_contents(tmp_path):
-            raise ValueError("更新包内容验证失败")
-            
-        # 设置临时文件的权限
-        os.chmod(tmp_path, 0o600)
-            
+        logger.info("文件验证通过")
         return tmp_path
+        
+    except httpx.TimeoutException:
+        logger.error("下载超时")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP错误: {e.response.status_code}")
+    except httpx.RequestError as e:
+        logger.error(f"网络请求失败: {e}")
     except Exception as e:
         logger.error(f"下载更新失败: {e}")
-        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+        
+    # 清理临时文件
+    if tmp_path and os.path.exists(tmp_path):
+        try:
             os.remove(tmp_path)
-        return None
+        except Exception as del_err:
+            logger.error(f"清理临时文件失败: {del_err}")
+    return None
 
-def apply_update(zip_path: str):
+def update_version(new_version: str) -> bool:
+    """更新配置文件中的版本号"""
+    try:
+        config_path = APP_DATA_DIR / 'update_config.json' if not DEBUG else Path('update_config.json')
+        
+        # 读取当前配置
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        # 更新版本号
+        config['CURRENT_VERSION'] = new_version
+        
+        # 写回配置文件
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+            
+        logger.info(f"版本号已更新: {new_version}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"更新版本号失败: {e}")
+        return False
+
+def apply_update(zip_path: str, new_version: str):
     """应用更新"""
-    script_path = Path(tempfile.mktemp(suffix='.bat'))
-    backup_path = backup_current_version()
-    
-    if not backup_path:
-        logger.error("备份失败，取消更新")
-        return
-    
-    abs_zip_path = Path(zip_path).resolve()
-    abs_cwd = Path.cwd().resolve()
-    abs_backup = Path(backup_path).resolve()
-    
-    # 创建临时解压目录
-    temp_extract_dir = Path(tempfile.mkdtemp(prefix='update_'))
-    abs_temp_dir = temp_extract_dir.resolve()
-
-    update_script = f"""
+    try:
+        # 验证路径安全性
+        abs_zip_path = Path(zip_path).resolve()
+        abs_cwd = Path.cwd().resolve()
+        
+        if not abs_zip_path.exists():
+            raise FileNotFoundError("更新包不存在")
+        
+        # 创建临时解压目录
+        with tempfile.TemporaryDirectory(prefix='update_') as temp_dir:
+            abs_temp_dir = Path(temp_dir).resolve()
+            
+            # 生成更新脚本
+            update_script = f"""
 @echo off
 chcp 65001 >nul
 title 正在更新程序...
-echo 正在等待程序关闭...
-timeout /t 5 /nobreak >nul
 
-REM 验证文件是否存在
-if not exist "{abs_zip_path}" (
-    echo 更新包不存在，正在恢复备份...
-    xcopy /E /Y /I "{abs_backup}" "{abs_cwd}"
-    echo 更新失败，已恢复备份
-    rmdir /S /Q "{abs_temp_dir}" 2>nul
-    timeout /t 5 >nul
-    exit /b 1
-)
-
-REM 解压到临时目录
 echo 正在解压更新包...
-powershell -Command "$progressPreference = 'Continue'; Expand-Archive -Path '{abs_zip_path}' -DestinationPath '{abs_temp_dir}' -Force -ErrorAction Stop"
+powershell -Command "Expand-Archive -Path '{abs_zip_path}' -DestinationPath '{abs_temp_dir}' -Force"
 if %ERRORLEVEL% neq 0 (
-    echo 解压失败，正在恢复备份...
-    xcopy /E /Y /I "{abs_backup}" "{abs_cwd}"
-    echo 已恢复备份
-    rmdir /S /Q "{abs_temp_dir}" 2>nul
-    timeout /t 5 >nul
-    exit /b 1
+    echo 解压失败
+    goto :CLEANUP
 )
 
-REM 复制更新文件
 echo 正在应用更新...
-xcopy /E /Y /I "{abs_temp_dir}\\*" "{abs_cwd}"
+xcopy "{abs_temp_dir}\\*" "{abs_cwd}" /E /Y /I
 if %ERRORLEVEL% neq 0 (
-    echo 更新失败，正在恢复备份...
-    xcopy /E /Y /I "{abs_backup}" "{abs_cwd}"
-    echo 已恢复备份
-    rmdir /S /Q "{abs_temp_dir}" 2>nul
-    timeout /t 5 >nul
-    exit /b 1
+    echo 更新失败
+    goto :CLEANUP
 )
 
-REM 清理文件
+:CLEANUP
 del "{abs_zip_path}" 2>nul
-rmdir /S /Q "{abs_backup}" 2>nul
 rmdir /S /Q "{abs_temp_dir}" 2>nul
-
 echo 更新完成
-timeout /t 5 >nul
+timeout /t 3 >nul
 (goto) 2>nul & del "%~f0"
 """
-    try:
-        # 设置更新脚本的权限
-        script_path.write_text(update_script, encoding='utf-8')
-        os.chmod(script_path, 0o700)
-        logger.info("开始执行更新脚本")
-        
-        # 直接执行批处理文件
-        subprocess.Popen(
-            [str(script_path)],
-            shell=True,
-            creationflags=subprocess.CREATE_NEW_CONSOLE
-        )
-        
-        logger.info("更新脚本已启动")
-        
+            
+            # 写入并执行更新脚本
+            script_path = Path(tempfile.mktemp(suffix='.bat'))
+            script_path.write_text(update_script, encoding='utf-8')
+            
+            # 更新版本号
+            update_version(new_version)
+            
+            # 执行更新脚本
+            subprocess.Popen(
+                [str(script_path)],
+                shell=True,
+                creationflags=subprocess.CREATE_NEW_CONSOLE
+            )
+            
+            logger.info("更新脚本已启动")
+            
     except Exception as e:
-        logger.error(f"创建更新脚本失败: {e}")
-        if script_path.exists():
-            script_path.unlink()
-        if temp_extract_dir.exists():
-            shutil.rmtree(temp_extract_dir, ignore_errors=True)
+        logger.error(f"应用更新失败: {e}")
+
+# 添加更新进度回调
+class UpdateProgress:
+    def __init__(self):
+        self._callbacks = []
+        
+    def register(self, callback):
+        self._callbacks.append(callback)
+        
+    def notify(self, status: str, progress: float):
+        for callback in self._callbacks:
+            try:
+                callback(status, progress)
+            except Exception as e:
+                logger.error(f"进度回调执行失败: {e}")
+
+# 添加代理支持
+def get_proxy_settings() -> Optional[str]:
+    """获取代理设置"""
+    try:
+        proxy_config = CONFIG.get("PROXY", {})
+        if proxy_config.get("enabled", False):
+            # 返回 https 代理地址，如果没有则返回 http 代理地址
+            return proxy_config.get("https") or proxy_config.get("http")
+    except Exception as e:
+        logger.warning(f"获取代理设置失败: {e}")
+    return None
 
 if __name__ == "__main__":
     try:
         @atexit.register
         def on_exit():
-            if hasattr(sys, "update_pending"):
-                apply_update(sys.update_pending)
+            if hasattr(sys, "update_pending") and hasattr(sys, "new_version"):
+                apply_update(sys.update_pending, sys.new_version)
 
         logger.info(f"当前版本: {CONFIG['CURRENT_VERSION']}")
+        print(f"\n正在检查更新...")
         
         if update_info := check_update():
-            logger.info(f"发现新版本: {update_info['version']}")
-            logger.info(f"更新说明: {update_info.get('description', '无')}")
-            logger.info(f"发布时间: {update_info.get('release_date', '未知')}")
+            new_version = update_info['version']
+            print(f"\n发现新版本: {new_version}")
+            print(f"更新说明: {update_info.get('description', '无')}")
+            print(f"发布时间: {update_info.get('release_date', '未知')}")
             
             # 自动下载并安装更新
-            logger.info("开始下载更新...")
+            print("\n准备下载更新...")
             if zip_file := download_update(update_info):
                 sys.update_pending = zip_file
-                logger.info("更新已下载，退出程序后自动安装...")
+                sys.new_version = new_version
+                print("\n更新已下载，退出程序后将自动安装")
+                print("按回车键退出并开始更新...")
+            else:
+                print("\n下载更新失败，请检查网络连接后重试")
+                print("按回车键退出程序...")
         else:
-            logger.info("未发现新版本")
+            print("\n当前已是最新版本")
+            print("按回车键退出程序...")
 
-        print("\n程序运行中...")
-        input("按回车退出程序")
+        input()
         
     except Exception as e:
         logger.error(f"程序异常: {e}")
-        input("程序发生错误，按回车退出...")
+        print("\n程序发生错误，请查看日志文件了解详情")
+        input("按回车键退出程序...")

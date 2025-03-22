@@ -4,8 +4,6 @@
     "CURRENT_VERSION": "1.0.0",
     "MAX_DOWNLOAD_SIZE": 104857600,
     "TIMEOUT": 30,
-    "BACKUP_DIR": "backup",
     "MAX_RETRY": 3,
-    "RETRY_DELAY": 5,
-    "MAX_BACKUP_COUNT": 5
+    "RETRY_DELAY": 5
 }

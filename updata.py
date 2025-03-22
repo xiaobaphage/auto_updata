@@ -354,7 +354,7 @@ def download_update(update_info: Dict) -> Optional[str]:
     
         client = httpx.Client(timeout=CONFIG["TIMEOUT"], verify=True, follow_redirects=True)
         with client.stream("GET", CONFIG["UPDATE_URL"]) as res:
-        res.raise_for_status()
+            res.raise_for_status()
             file_size = int(res.headers.get("content-length", 0))
             if file_size > CONFIG["MAX_DOWNLOAD_SIZE"]:
                 raise ValueError(f"更新包过大: {file_size/1024/1024:.1f}MB")
@@ -370,16 +370,16 @@ def download_update(update_info: Dict) -> Optional[str]:
                 logger.warning(f"警告：内容类型 {content_type} 可能不是zip文件")
             
         hasher = hashlib.sha256()
-            downloaded_size = 0
-            with open(tmp_path, "wb") as f:
-                with tqdm(total=file_size, unit='B', unit_scale=True, desc="下载进度") as pbar:
-                    for chunk in res.iter_bytes(chunk_size=8192):
-                        downloaded_size += len(chunk)
-                        if downloaded_size > CONFIG["MAX_DOWNLOAD_SIZE"]:
-                            raise ValueError("文件大小超过限制")
+        downloaded_size = 0
+        with open(tmp_path, "wb") as f:
+            with tqdm(total=file_size, unit='B', unit_scale=True, desc="下载进度") as pbar:
+                for chunk in res.iter_bytes(chunk_size=8192):
+                    downloaded_size += len(chunk)
+                    if downloaded_size > CONFIG["MAX_DOWNLOAD_SIZE"]:
+                        raise ValueError("文件大小超过限制")
                 hasher.update(chunk)
                 f.write(chunk)
-                        pbar.update(len(chunk))
+                pbar.update(len(chunk))
         
         calculated_hash = hasher.hexdigest().upper()
         expected_hash = update_info["sha256"].upper()

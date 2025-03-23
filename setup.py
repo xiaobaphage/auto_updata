@@ -10,6 +10,7 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/xiaobaphage/auto_updata",
     packages=find_packages(),
+    package_dir={"auto_updata": "auto_updata"},
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Developers",
@@ -32,12 +33,9 @@ setup(
         "pathlib>=1.0.1",
     ],
     package_data={
-        "auto_updata": [
-            "README.md",
-            "LICENSE",
-            "update_config.json",
-        ],
+        "auto_updata": ["update_config.json"],
     },
+    include_package_data=True,
     entry_points={
         "console_scripts": [
             "auto_updata=auto_updata.main:main",

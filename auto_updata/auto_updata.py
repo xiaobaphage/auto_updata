@@ -153,15 +153,7 @@ def validate_config(config: Dict) -> bool:
 
 def load_config() -> Dict:
     """从配置文件加载配置"""
-    if DEBUG:
-        config_path = Path('update_config.json')
-    else:
-        # 生产环境下配置文件放在用户数据目录
-        config_path = APP_DATA_DIR / 'update_config.json'
-    
-    logger.info(f"配置文件路径: {config_path.absolute()}")
-    logger.info(f"运行模式: {'开发环境' if DEBUG else '生产环境'}")
-    
+    # 默认配置
     default_config = {
         "VERSION_URL": "https://your-version-url/version.json",
         "UPDATE_URL": "https://your-update-url/update.zip",
@@ -172,27 +164,72 @@ def load_config() -> Dict:
         "RETRY_DELAY": 5
     }
     
-    if config_path.exists():
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = {**default_config, **json.load(f)}
-                if validate_config(config):
-                    logger.info("成功加载配置文件")
-                    return config
-                logger.warning("配置验证失败，使用默认配置")
-        except Exception as e:
-            logger.warning(f"加载配置文件失败: {e}，使用默认配置")
+    # 程序运行目录中的配置文件路径
+    exe_config_path = Path.cwd() / 'update_config.json'
+    
+    # 用户数据目录中的配置文件路径
+    if DEBUG:
+        app_config_path = Path('update_config.json')
     else:
-        # 如果配置文件不存在，创建默认配置文件
+        app_config_path = APP_DATA_DIR / 'update_config.json'
+    
+    logger.info(f"运行模式: {'开发环境' if DEBUG else '生产环境'}")
+    
+    config = default_config.copy()
+    
+    # 在生产环境下，优先检查程序运行目录的配置文件
+    if not DEBUG and exe_config_path.exists():
         try:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(config_path, 'w', encoding='utf-8') as f:
+            # 加载程序目录的配置
+            with open(exe_config_path, 'r', encoding='utf-8') as f:
+                loaded_config = json.load(f)
+                config.update(loaded_config)
+                logger.info(f"已加载程序目录配置: {exe_config_path.absolute()}")
+            
+            # 确保用户数据目录存在
+            app_config_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 将程序目录的配置复制到用户数据目录
+            with open(app_config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=4)
+            logger.info(f"已将程序目录配置同步到用户数据目录: {app_config_path}")
+            
+            # 验证配置
+            if validate_config(config):
+                logger.info("配置验证通过")
+                return config
+            else:
+                logger.warning("程序目录配置验证失败，尝试使用其他配置")
+        except Exception as e:
+            logger.warning(f"加载程序目录配置失败: {e}")
+    
+    # 如果没有程序目录配置或加载失败，尝试加载用户数据目录配置
+    if app_config_path.exists():
+        try:
+            with open(app_config_path, 'r', encoding='utf-8') as f:
+                loaded_config = json.load(f)
+                config.update(loaded_config)
+                logger.info(f"已加载用户配置: {app_config_path.absolute()}")
+        except Exception as e:
+            logger.warning(f"加载用户配置失败: {e}")
+    
+    # 如果没有任何配置文件，创建默认配置
+    if not app_config_path.exists():
+        try:
+            app_config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(app_config_path, 'w', encoding='utf-8') as f:
                 json.dump(default_config, f, ensure_ascii=False, indent=4)
-            logger.info(f"已创建默认配置文件: {config_path}")
+            logger.info(f"已创建默认配置文件: {app_config_path}")
         except Exception as e:
             logger.warning(f"创建默认配置文件失败: {e}")
     
-    return default_config
+    # 验证最终配置
+    if validate_config(config):
+        logger.info("配置验证通过")
+        return config
+    else:
+        logger.warning("配置验证失败，使用默认配置")
+        return default_config
 
 CONFIG = load_config()
 

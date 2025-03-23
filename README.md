@@ -52,6 +52,18 @@ if __name__ == "__main__":
 }
 ```
 
+在 `update_config.json` 中配置：
+
+```json
+{
+    "version": "1.0.0",
+    "sha256": "更新包的SHA256值",
+    "description": "更新说明",
+    "release_date": "2024-03-20",
+    "min_required": "1.0.0"
+}
+```
+
 ## 许可证
 
 MIT License 

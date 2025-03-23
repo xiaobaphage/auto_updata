@@ -22,11 +22,15 @@ def main() -> None:
     try:
         print("程序启动中...")
         
-        # 初始化更新器（会在后台检查更新）
+        # 初始化更新器（会在后台线程中检查更新）
         updater = Updater.initialize()
         
         # 运行主程序
         run_main_program()
+        
+        # 等待更新检查完成（最多等待5秒）
+        if not updater.wait_for_check(timeout=5):
+            logger.warning("更新检查尚未完成，但程序已退出")
         
         # 检查是否有待安装的更新
         if updater.has_update:
@@ -34,6 +38,9 @@ def main() -> None:
             
     except KeyboardInterrupt:
         print("\n正在退出程序...")
+        # 等待更新检查完成（最多等待5秒）
+        if not updater.wait_for_check(timeout=5):
+            logger.warning("更新检查尚未完成，但程序已退出")
         if updater.has_update:
             print("正在安装更新，请稍候...")
     except Exception as e:

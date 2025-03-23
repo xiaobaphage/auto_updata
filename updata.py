@@ -17,9 +17,27 @@ from tqdm import tqdm
 from datetime import datetime
 import threading
 
+# 修改全局配置部分
+import sys
+import os
+
+def is_development() -> bool:
+    """检查是否为开发环境"""
+    # 检查是否是 .py 文件运行
+    return sys.argv[0].endswith('.py')
+
+def get_executable_dir() -> Path:
+    """获取程序运行目录"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后的路径
+        return Path(sys._MEIPASS)
+    else:
+        # 开发环境下的路径
+        return Path(os.path.dirname(os.path.abspath(__file__)))
+
 # 全局配置
 APP_NAME = "YourAppName"  # 应用程序名称
-DEBUG = True
+DEBUG = is_development()  # 自动设置 DEBUG 模式
 
 # 获取应用数据目录
 def get_app_data_dir() -> Path:
@@ -27,6 +45,7 @@ def get_app_data_dir() -> Path:
     if DEBUG:
         return Path.cwd()
     else:
+        # 在生产环境使用 APPDATA 目录
         app_data = Path(os.getenv('APPDATA', '')) / APP_NAME
         app_data.mkdir(parents=True, exist_ok=True)
         return app_data
@@ -134,8 +153,14 @@ def validate_config(config: Dict) -> bool:
 
 def load_config() -> Dict:
     """从配置文件加载配置"""
-    config_path = APP_DATA_DIR / 'update_config.json' if not DEBUG else Path('update_config.json')
+    if DEBUG:
+        config_path = Path('update_config.json')
+    else:
+        # 生产环境下配置文件放在用户数据目录
+        config_path = APP_DATA_DIR / 'update_config.json'
+    
     logger.info(f"配置文件路径: {config_path.absolute()}")
+    logger.info(f"运行模式: {'开发环境' if DEBUG else '生产环境'}")
     
     default_config = {
         "VERSION_URL": "https://your-version-url/version.json",
@@ -304,7 +329,14 @@ def apply_update(zip_path: str, new_version: str):
     try:
         # 验证路径安全性
         abs_zip_path = Path(zip_path).resolve()
-        abs_cwd = Path.cwd().resolve()
+        
+        # 获取正确的应用目录
+        if getattr(sys, 'frozen', False):
+            # PyInstaller 打包后的应用目录
+            app_dir = Path(sys.executable).parent.resolve()
+        else:
+            # 开发环境下的目录
+            app_dir = Path.cwd().resolve()
         
         if not abs_zip_path.exists():
             raise FileNotFoundError("更新包不存在")
@@ -327,7 +359,7 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo 正在应用更新...
-xcopy "{abs_temp_dir}\\*" "{abs_cwd}" /E /Y /I
+xcopy "{abs_temp_dir}\\*" "{app_dir}" /E /Y /I
 if %ERRORLEVEL% neq 0 (
     echo 更新失败
     goto :CLEANUP
@@ -377,19 +409,38 @@ class Updater:
         self._is_checking: bool = False
         self._update_info: Optional[Dict[str, str]] = None
         self._update_file: Optional[str] = None
+        self._check_thread: Optional[threading.Thread] = None
         
         # 注册退出时的更新
         atexit.register(self._apply_pending_update)
-        
-        # 启动时立即检查更新
-        self._check_update()
 
-    def _check_update(self) -> None:
-        """检查更新"""
+    def start_check(self) -> None:
+        """启动更新检查线程"""
         if self._is_checking:
             logger.warning("更新检查已在进行中")
             return
             
+        self._check_thread = threading.Thread(
+            target=self._check_update,
+            daemon=True  # 设置为守护线程，这样主程序退出时线程会自动结束
+        )
+        self._check_thread.start()
+
+    def wait_for_check(self, timeout: float = None) -> bool:
+        """
+        等待更新检查完成
+        Args:
+            timeout: 超时时间（秒），None表示一直等待
+        Returns:
+            bool: 是否检查完成
+        """
+        if self._check_thread and self._check_thread.is_alive():
+            self._check_thread.join(timeout)
+            return not self._check_thread.is_alive()
+        return True
+
+    def _check_update(self) -> None:
+        """检查更新"""
         self._is_checking = True
         try:
             current_version = CONFIG["CURRENT_VERSION"]
@@ -463,4 +514,6 @@ class Updater:
             print(f"更新说明: {update_info.get('description', '无')}")
             print("程序退出时将自动安装更新\n")
         
-        return cls(on_update_available=_on_update_found)  # on_check_complete 可以省略，因为默认就是 None
+        updater = cls(on_update_available=_on_update_found)
+        updater.start_check()  # 启动更新检查线程
+        return updater

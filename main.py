@@ -1,6 +1,6 @@
 import time
 import logging
-from updata import Updater, logger
+from auto_updata import Updater, logger
 
 def run_main_program() -> None:
     """运行主程序的实际逻辑"""
